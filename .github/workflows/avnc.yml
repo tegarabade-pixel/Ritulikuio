@@ -1,0 +1,202 @@
+name: Secure AVNC TightVNC (Public Repo)
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: secure-avnc-tightvnc
+  cancel-in-progress: true
+
+jobs:
+  avnc:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    environment: rdp
+
+    steps:
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-avnc
+          log-mode: quiet
+
+      - name: Optimize Windows desktop for AVNC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host 'Applying low-latency desktop settings...'
+
+          # High-performance power plan and no display/sleep timeout.
+          powercfg /setactive SCHEME_MIN | Out-Null
+          powercfg /change monitor-timeout-ac 0 | Out-Null
+          powercfg /change standby-timeout-ac 0 | Out-Null
+
+          # Reduce bandwidth-expensive Windows effects.
+          New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Force | Out-Null
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' `
+            -Name EnableTransparency -Type DWord -Value 0 -Force
+
+          New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Force | Out-Null
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' `
+            -Name VisualFXSetting -Type DWord -Value 2 -Force
+
+          New-Item -Path 'HKCU:\Control Panel\Desktop\WindowMetrics' -Force | Out-Null
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\WindowMetrics' `
+            -Name MinAnimate -Value '0' -Force
+
+          New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Force | Out-Null
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' `
+            -Name TaskbarAnimations -Type DWord -Value 0 -Force
+
+          # 1600x720 = 20:9, matching the phone in landscape.
+          # Try the native ServerCore cmdlet if available. If the virtual display
+          # does not expose this mode, AVNC "Fit to screen" remains the fallback.
+          $resolutionApplied = $false
+          try {
+            if (Get-Command Set-DisplayResolution -ErrorAction SilentlyContinue) {
+              Set-DisplayResolution -Width 1600 -Height 720 -Force -ErrorAction Stop
+              $resolutionApplied = $true
+            }
+          } catch {
+            Write-Host "1600x720 could not be applied by Set-DisplayResolution: $($_.Exception.Message)"
+          }
+
+          if ($resolutionApplied) {
+            Write-Host 'Display target applied: 1600x720 (20:9)'
+          } else {
+            Write-Host 'Display target 1600x720 was not exposed by the VM; use AVNC Fit to screen.'
+          }
+
+      - name: Install and secure TightVNC
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            throw 'VNC_PASSWORD Environment secret is missing.'
+          }
+
+          # Classic VNC authentication only uses an 8-character password.
+          # Keep it exactly 8 alphanumeric characters to avoid ambiguity.
+          if ($env:VNC_PASSWORD -notmatch '^[A-Za-z0-9]{8}$') {
+            throw 'VNC_PASSWORD must be exactly 8 letters/numbers.'
+          }
+          Write-Output "::add-mask::$env:VNC_PASSWORD"
+
+          $tsIP = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $tsIP) {
+            throw 'Tailscale IPv4 address was not assigned.'
+          }
+
+          $version = '2.8.88'
+          $msi = Join-Path $env:RUNNER_TEMP 'tightvnc.msi'
+          $url = "https://www.tightvnc.com/download/$version/tightvnc-$version-gpl-setup-64bit.msi"
+
+          Write-Host "Downloading TightVNC $version (official 64-bit MSI)..."
+          Invoke-WebRequest -Uri $url -OutFile $msi
+
+          # 33 ms screen polling ~= 30.3 update polls/second.
+          # TightVNC does not expose a literal FPS limiter, so this is the
+          # closest server-side 30 FPS-style cap.
+          $args = @(
+            '/i'
+            "`"$msi`""
+            '/quiet'
+            '/norestart'
+            'ADDLOCAL=Server'
+            'SERVER_REGISTER_AS_SERVICE=1'
+            'SERVER_ADD_FIREWALL_EXCEPTION=0'
+            'SERVER_ALLOW_SAS=1'
+            'SET_ACCEPTRFBCONNECTIONS=1'
+            'VALUE_OF_ACCEPTRFBCONNECTIONS=1'
+            'SET_ACCEPTHTTPCONNECTIONS=1'
+            'VALUE_OF_ACCEPTHTTPCONNECTIONS=0'
+            'SET_USEVNCAUTHENTICATION=1'
+            'VALUE_OF_USEVNCAUTHENTICATION=1'
+            'SET_PASSWORD=1'
+            "VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
+            'SET_RFBPORT=1'
+            'VALUE_OF_RFBPORT=5900'
+            'SET_POLLINGINTERVAL=1'
+            'VALUE_OF_POLLINGINTERVAL=33'
+            'SET_REMOVEWALLPAPER=1'
+            'VALUE_OF_REMOVEWALLPAPER=1'
+            'SET_GRABTRANSPARENTWINDOWS=1'
+            'VALUE_OF_GRABTRANSPARENTWINDOWS=0'
+            'SET_BLOCKREMOTEINPUT=1'
+            'VALUE_OF_BLOCKREMOTEINPUT=0'
+            'SET_LOCALINPUTPRIORITY=1'
+            'VALUE_OF_LOCALINPUTPRIORITY=0'
+            'SET_RUNCONTROLINTERFACE=1'
+            'VALUE_OF_RUNCONTROLINTERFACE=0'
+            'SET_LOGLEVEL=1'
+            'VALUE_OF_LOGLEVEL=0'
+          )
+
+          Write-Host 'Installing TightVNC server in service mode...'
+          $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $args -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw 'TightVNC MSI installation timed out after 3 minutes.'
+          }
+          if ($p.ExitCode -notin @(0, 3010)) {
+            throw "TightVNC MSI failed with exit code $($p.ExitCode)."
+          }
+
+          # Defense in depth: do not keep installer-created broad rules.
+          Get-NetFirewallRule -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like '*TightVNC*' } |
+            Disable-NetFirewallRule -ErrorAction SilentlyContinue
+
+          Get-NetFirewallRule -DisplayName 'AVNC TightVNC via Tailscale' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule -DisplayName 'AVNC TightVNC via Tailscale' `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5900 `
+            -LocalAddress $tsIP -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+
+          Set-Service -Name 'tvnserver' -StartupType Automatic
+          Restart-Service -Name 'tvnserver' -Force
+          Start-Sleep -Seconds 5
+
+          $listener = Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            Get-Service -Name 'tvnserver' | Format-List | Out-String | Write-Host
+            throw 'TightVNC server is not listening on TCP 5900.'
+          }
+
+          # Verify the VNC port through the runner's own Tailscale address.
+          $probe = Test-NetConnection -ComputerName $tsIP -Port 5900 -WarningAction SilentlyContinue
+          if (-not $probe.TcpTestSucceeded) {
+            throw "TCP 5900 is listening, but Tailscale path $tsIP`:5900 failed."
+          }
+
+          Write-Host ''
+          Write-Host '=== AVNC READY ==='
+          Write-Host 'Tailscale hostname : gh-avnc'
+          Write-Host "Tailscale IPv4     : $tsIP"
+          Write-Host "AVNC endpoint      : ${tsIP}:5900"
+          Write-Host 'VNC password       : use VNC_PASSWORD Environment secret'
+          Write-Host 'Desktop target     : 1600x720 (20:9 landscape)'
+          Write-Host 'Update target      : ~30 Hz (33 ms TightVNC polling)'
+          Write-Host 'Capture            : TightVNC Direct3D path left enabled'
+          Write-Host 'Wallpaper          : hidden while viewer is connected'
+          Write-Host 'Firewall           : Tailscale IPv4 peers only'
+          Write-Host '=================='
+          Write-Host ''
+          Write-Host 'AVNC Android: Encoding=Tight, Scaling=Fit to screen, orientation=Landscape.'
+
+      - name: Keep AVNC session available
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 69; $i++) {
+            Write-Host "[$(Get-Date -Format o)] AVNC session active ($i/69)"
+            Start-Sleep -Seconds 300
+          }
+          
