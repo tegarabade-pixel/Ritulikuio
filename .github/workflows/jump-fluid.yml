@@ -1,4 +1,4 @@
-name: Secure Jump Fluid (Public Repo)
+name: Secure Jump Fluid (Public Repo) v2
 
 on:
   workflow_dispatch:
@@ -16,7 +16,37 @@ jobs:
     environment: rdp
 
     steps:
-      - name: Install and configure Jump Desktop Connect 10
+      - name: Prepare temporary Windows account
+        shell: pwsh
+        env:
+          FLUID_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:FLUID_PASSWORD)) {
+            throw 'RDP_PASSWORD Environment secret is missing.'
+          }
+          if ($env:FLUID_PASSWORD.Length -lt 14) {
+            throw 'RDP_PASSWORD must be at least 14 characters.'
+          }
+
+          Write-Output "::add-mask::$env:FLUID_PASSWORD"
+
+          $username = 'fluiduser'
+          $securePass = ConvertTo-SecureString $env:FLUID_PASSWORD -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($null -eq $existing) {
+            New-LocalUser -Name $username -Password $securePass `
+              -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $username -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group 'Administrators' -Member $username -ErrorAction SilentlyContinue
+          Write-Host 'Temporary Windows account ready: fluiduser'
+
+      - name: Install Jump Desktop Connect with Fluid
         shell: pwsh
         env:
           JUMP_CONNECT_CODE: ${{ secrets.JUMP_CONNECT_CODE }}
@@ -36,8 +66,18 @@ jobs:
           Write-Host 'Downloading Jump Desktop Connect 10.15.23...'
           Invoke-WebRequest -Uri $url -OutFile $installer
 
-          Write-Host 'Installing Jump Desktop Connect silently...'
-          $p = Start-Process -FilePath $installer -ArgumentList '/qn' -PassThru
+          # Officially supported installer variables:
+          # CONNECTCODE adds the machine to the Jump account,
+          # FLUIDENABLED enables Fluid, RDPENABLED disables RDP tunnelling.
+          Write-Host 'Installing Jump Desktop Connect and attaching it to your account...'
+          $installArgs = @(
+            '/qn'
+            "CONNECTCODE=$connectCode"
+            'FLUIDENABLED=true'
+            'RDPENABLED=false'
+          )
+
+          $p = Start-Process -FilePath $installer -ArgumentList $installArgs -PassThru
           if (-not $p.WaitForExit(180000)) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             throw 'Jump Desktop Connect installation timed out after 3 minutes.'
@@ -48,6 +88,7 @@ jobs:
 
           $regPath = 'HKLM:\SOFTWARE\Jump Desktop\Connect\Shared'
           $connectPath = $null
+
           for ($i = 0; $i -lt 30; $i++) {
             try {
               $connectPath = (Get-ItemProperty $regPath -ErrorAction Stop).ConnectPath
@@ -64,48 +105,42 @@ jobs:
 
           Write-Host "JumpConnect path: $connectPath"
 
-          # Configure the computer BEFORE attaching it to the account.
+          # Best-effort hardening / naming.
+          # Some Jump Connect 10 builds return a non-zero exit code for
+          # --serverconfig even when installation/account attachment is healthy,
+          # so these are intentionally not used as fatal readiness checks.
           & $connectPath --serverconfig ComputerName=gh-fluid
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to set ComputerName.' }
-
-          & $connectPath --serverconfig RDPEnabled=0
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable RDP tunnelling.' }
+          Write-Host "ComputerName config exit code: $LASTEXITCODE"
 
           & $connectPath --serverconfig VNCEnabled=0
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable VNC tunnelling.' }
+          Write-Host "VNC disable exit code: $LASTEXITCODE"
 
           & $connectPath --serverconfig RTCEnabled=1
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to enable Fluid.' }
+          Write-Host "Fluid enable exit code: $LASTEXITCODE"
 
           & $connectPath --serverconfig RtcLocalServer=0
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable manual/local Fluid server.' }
+          Write-Host "Manual Fluid server disable exit code: $LASTEXITCODE"
 
-          Write-Host 'Adding this ephemeral runner to your Jump Desktop account...'
-          & $connectPath --connectcode $connectCode
-          if ($LASTEXITCODE -ne 0) {
-            throw "JumpConnect --connectcode failed with exit code $LASTEXITCODE."
-          }
-
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 20
 
           $jumpProcesses = Get-Process -ErrorAction SilentlyContinue |
             Where-Object { $_.ProcessName -match 'Jump|Fluid' }
 
           if (-not $jumpProcesses) {
-            throw 'Jump Desktop Connect is not running after configuration.'
+            throw 'Jump Desktop Connect is not running after installation.'
           }
 
           Write-Host ''
           Write-Host '=== JUMP FLUID READY ==='
-          Write-Host 'Computer name : gh-fluid'
-          Write-Host 'Protocol      : Fluid'
-          Write-Host 'RDP tunnel    : disabled'
-          Write-Host 'VNC tunnel    : disabled'
-          Write-Host 'Tailscale     : not used for the Fluid path'
-          Write-Host 'Authentication: your Jump Desktop account'
+          Write-Host 'Protocol            : Fluid'
+          Write-Host 'RDP tunnel          : disabled'
+          Write-Host 'Windows username    : fluiduser'
+          Write-Host 'Windows password    : use the existing RDP_PASSWORD Environment secret'
+          Write-Host 'Authentication      : your Jump Desktop account'
+          Write-Host 'Computer display    : look for the newest ONLINE computer in Jump Desktop'
           Write-Host '========================'
           Write-Host ''
-          Write-Host 'Open Jump Desktop on Android, sign in to the same account, and select the ONLINE gh-fluid computer.'
+          Write-Host 'Open Jump Desktop Android, sign in to the same account, and select the newest ONLINE computer.'
 
       - name: Keep Fluid session available
         shell: pwsh
