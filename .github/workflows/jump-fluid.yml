@@ -1,0 +1,117 @@
+name: Secure Jump Fluid (Public Repo)
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: secure-jump-fluid
+  cancel-in-progress: true
+
+jobs:
+  fluid:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    environment: rdp
+
+    steps:
+      - name: Install and configure Jump Desktop Connect 10
+        shell: pwsh
+        env:
+          JUMP_CONNECT_CODE: ${{ secrets.JUMP_CONNECT_CODE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:JUMP_CONNECT_CODE)) {
+            throw 'JUMP_CONNECT_CODE Environment secret is missing.'
+          }
+
+          Write-Output "::add-mask::$env:JUMP_CONNECT_CODE"
+          $connectCode = ($env:JUMP_CONNECT_CODE -replace '\s','')
+
+          $installer = Join-Path $env:RUNNER_TEMP 'JumpDesktopConnect-10.15.23.exe'
+          $url = 'https://jumpdesktop.com/downloads/connect/JumpDesktopConnect-10.15.23.exe'
+
+          Write-Host 'Downloading Jump Desktop Connect 10.15.23...'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          Write-Host 'Installing Jump Desktop Connect silently...'
+          $p = Start-Process -FilePath $installer -ArgumentList '/qn' -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw 'Jump Desktop Connect installation timed out after 3 minutes.'
+          }
+          if ($p.ExitCode -ne 0) {
+            throw "Jump Desktop Connect installer failed with exit code $($p.ExitCode)."
+          }
+
+          $regPath = 'HKLM:\SOFTWARE\Jump Desktop\Connect\Shared'
+          $connectPath = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $connectPath = (Get-ItemProperty $regPath -ErrorAction Stop).ConnectPath
+            } catch {
+              $connectPath = $null
+            }
+            if ($connectPath -and (Test-Path $connectPath)) { break }
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $connectPath -or -not (Test-Path $connectPath)) {
+            throw 'JumpConnect.exe was not found after installation.'
+          }
+
+          Write-Host "JumpConnect path: $connectPath"
+
+          # Configure the computer BEFORE attaching it to the account.
+          & $connectPath --serverconfig ComputerName=gh-fluid
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to set ComputerName.' }
+
+          & $connectPath --serverconfig RDPEnabled=0
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable RDP tunnelling.' }
+
+          & $connectPath --serverconfig VNCEnabled=0
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable VNC tunnelling.' }
+
+          & $connectPath --serverconfig RTCEnabled=1
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to enable Fluid.' }
+
+          & $connectPath --serverconfig RtcLocalServer=0
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable manual/local Fluid server.' }
+
+          Write-Host 'Adding this ephemeral runner to your Jump Desktop account...'
+          & $connectPath --connectcode $connectCode
+          if ($LASTEXITCODE -ne 0) {
+            throw "JumpConnect --connectcode failed with exit code $LASTEXITCODE."
+          }
+
+          Start-Sleep -Seconds 15
+
+          $jumpProcesses = Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -match 'Jump|Fluid' }
+
+          if (-not $jumpProcesses) {
+            throw 'Jump Desktop Connect is not running after configuration.'
+          }
+
+          Write-Host ''
+          Write-Host '=== JUMP FLUID READY ==='
+          Write-Host 'Computer name : gh-fluid'
+          Write-Host 'Protocol      : Fluid'
+          Write-Host 'RDP tunnel    : disabled'
+          Write-Host 'VNC tunnel    : disabled'
+          Write-Host 'Tailscale     : not used for the Fluid path'
+          Write-Host 'Authentication: your Jump Desktop account'
+          Write-Host '========================'
+          Write-Host ''
+          Write-Host 'Open Jump Desktop on Android, sign in to the same account, and select the ONLINE gh-fluid computer.'
+
+      - name: Keep Fluid session available
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 69; $i++) {
+            Write-Host "[$(Get-Date -Format o)] Jump Fluid session active ($i/69)"
+            Start-Sleep -Seconds 300
+          }
+          
